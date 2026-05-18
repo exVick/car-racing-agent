@@ -613,8 +613,9 @@ def train_dagger(args):
     # keep a sample for the onnx export at the end
     sample_state_arr, _ = train_set[0]
     sample_state = torch.from_numpy(sample_state_arr).unsqueeze(0).to(device)
-
-    best_val_loss = float("inf")
+    
+    # track the best mean env score across iterations env eval is the real selector
+    best_dagger_score = -float("inf")
     global_step = 0
 
     for iteration in range(args.dagger_iterations):
@@ -710,18 +711,47 @@ def train_dagger(args):
                   f"train_loss {train_loss_avg:.4f} "
                   f"val_loss {val_loss:.4f} val_acc {val_acc:.4f}")
 
-            # save best checkpoint on val loss
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save({
-                    "iteration": iteration + 1,
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": val_loss,
-                    "val_acc": val_acc,
-                    "args": vars(args),
-                }, out_dir / "checkpoints" / "best.pt")
+        # run a proper env evaluation to pick the best dagger model
+        # this is the real selection signal val_loss is misleading in dagger
+        # we use a fixed set of 10 seeds so iterations are compared on the same tracks
+        model.eval()
+        eval_agent = Agent(model, device)
+        iter_scores = []
+        for ep in range(args.dagger_eval_episodes):
+            # seeds offset by 10000 so they never overlap with rollout or final eval seeds
+            ep_seed = args.seed + 10000 + ep
+            iter_scores.append(run_episode(eval_agent, seed=ep_seed))
+
+        mean_iter = float(np.mean(iter_scores))
+        std_iter = float(np.std(iter_scores))
+        min_iter = float(np.min(iter_scores))
+        max_iter = float(np.max(iter_scores))
+        print(f"iter {iteration+1} env eval mean {mean_iter:.2f} std {std_iter:.2f} "
+              f"min {min_iter:.2f} max {max_iter:.2f}")
+
+        wandb.log({
+            "dagger/iter_eval_mean": mean_iter,
+            "dagger/iter_eval_std": std_iter,
+            "dagger/iter_eval_min": min_iter,
+            "dagger/iter_eval_max": max_iter,
+            "dagger/iteration": iteration + 1,
+        }, step=global_step)
+
+        # save best_dagger checkpoint based on mean env score
+        if mean_iter > best_dagger_score:
+            best_dagger_score = mean_iter
+            torch.save({
+                "iteration": iteration + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "env_eval_mean": mean_iter,
+                "env_eval_std": std_iter,
+                "args": vars(args),
+            }, out_dir / "checkpoints" / "best_dagger.pt")
+            print(f"new best dagger score {best_dagger_score:.2f}")
+            wandb.log({"dagger/best_dagger_score": best_dagger_score},
+                      step=global_step)
+
 
     # always save the last checkpoint too
     torch.save({
@@ -731,11 +761,12 @@ def train_dagger(args):
         "args": vars(args),
     }, out_dir / "checkpoints" / "last.pt")
 
-    # reload best and export onnx for submission
-    print("loading best for onnx export")
-    best = torch.load(out_dir / "checkpoints" / "best.pt", map_location=device, weights_only=False)
+    # reload the model that scored highest in env evaluation across iterations
+    print(f"loading best_dagger (env score {best_dagger_score:.2f}) for onnx export")
+    best = torch.load(out_dir / "checkpoints" / "best_dagger.pt",
+                      map_location=device, weights_only=False)
     model.load_state_dict(best["model_state_dict"])
-    save_as_onnx(model, sample_state, str(out_dir / "checkpoints" / "model.onnx"))
+    save_as_onnx(model, sample_state, str(out_dir / "checkpoints" / "best_dagger.onnx"))
 
     # final environment evaluation with the best model
     print("running final evaluation in env")
@@ -790,6 +821,8 @@ def parse_args():
                    help="floor for beta keeps some expert mixing if greater than zero")
     p.add_argument("--dagger_video_every", type=int, default=1,
                    help="record a rollout video every n iterations")
+    p.add_argument("--dagger_eval_episodes", type=int, default=10,
+                   help="number of env episodes used to score each iteration for model selection")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb_project", default="carracing-imitation")
