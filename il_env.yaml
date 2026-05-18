@@ -1,0 +1,29 @@
+name: il-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - ffmpeg
+  - swig
+  - matplotlib
+  - seaborn
+  - ipykernel
+  - ipython
+  - ipywidgets
+  - tqdm
+  - pip:
+      - pyopengl
+      - gymnasium==1.2.3
+      - "gymnasium[box2d]"
+      - pyvirtualdisplay
+      - imageio-ffmpeg
+      - moviepy==1.0.3
+      - onnx==1.21.0
+      - onnx2pytorch==0.5.3
+      - onnxscript==0.7.0
+      - numpy==2.4.2
+      - opencv-python-headless
+      - torch
+      - gdown
