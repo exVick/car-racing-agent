@@ -2,6 +2,7 @@ import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
+import shutil
 import argparse
 import logging
 import random
@@ -464,13 +465,294 @@ def evaluate_in_env(args, model=None, device=None, video_dir=None):
 
 
 # ==========================================================
+# dagger
+# ==========================================================
+
+def load_expert(expert_path, device):
+    """
+    load a pretrained expert from an onnx file
+    the expert is expected to take 4 stacked grayscale frames as input
+    """
+    onnx_model = onnx.load(expert_path)
+    expert = ConvertModel(onnx_model).to(device).eval()
+    return expert
+
+
+def init_dagger_dataset_dir(source_dir, target_dir):
+    """
+    initialize the dagger train folder by hard linking from the bc train folder
+    hard linking is near instant and avoids duplicating disk usage
+    if the target already has files we reuse them to support resuming a run
+    """
+    target = Path(target_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    existing = list(target.glob("*.npz"))
+    if existing:
+        print(f"dagger dir already has {len(existing)} files reusing")
+        return
+    src = Path(source_dir)
+    count = 0
+    for f in src.glob("*.npz"):
+        try:
+            os.link(f, target / f.name)
+        except OSError:
+            # fall back to a real copy if hard linking is not supported
+            shutil.copy(f, target / f.name)
+        count += 1
+    print(f"linked {count} files from {source_dir} to {target_dir}")
+
+
+def beta_schedule(iteration, decay):
+    # exponential decay starting at 1 0 at iteration 0
+    return decay ** iteration
+
+
+def dagger_rollout(model, expert_agent, device, beta, seed,
+                   video_dir=None, capture_video=False):
+    """
+    run one rollout collecting state expert action pairs
+    actions to execute come from a mixture of expert and student via beta
+    every visited state is labeled with the experts action regardless
+    returns the collected states the expert labels and the episode score
+    """
+    student_agent = Agent(model, device)
+    env = make_env(seed=seed, video_dir=video_dir, capture_video=capture_video)
+    state, _ = env.reset()
+
+    collected_states = []
+    collected_actions = []
+    score = 0.0
+    done = False
+
+    while not done:
+        # always ask the expert what it would do here this is the label
+        # the expert consumes the full 4 stacked observation
+        expert_action = expert_agent.select_action(state)
+
+        # decide who actually steps the environment this turn
+        if random.random() < beta:
+            action_to_execute = expert_action
+        else:
+            # student needs only the latest frame as a single channel image
+            action_to_execute = student_agent.select_action(state[-1][np.newaxis, ...])
+
+        # save the latest single frame paired with the expert label
+        # this keeps the training format consistent with bc demonstrations
+        collected_states.append(state[-1])
+        collected_actions.append(expert_action)
+
+        state, reward, terminated, truncated, _ = env.step(action_to_execute)
+        score += reward
+        done = terminated or truncated
+
+    env.close()
+    return np.array(collected_states), np.array(collected_actions), score
+
+
+def train_dagger(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device {device}")
+    torch.backends.cudnn.benchmark = True
+    set_seeds(args.seed)
+
+    # build a unique run directory mirroring train_bc
+    run_name = "dagger-" + strftime("%Y-%m-%dT%H-%M-%S")
+    out_dir = Path(args.output_dir) / run_name
+    (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (out_dir / "videos").mkdir(parents=True, exist_ok=True)
+    print(f"run dir {out_dir}")
+
+    # init wandb live monitoring
+    wandb.init(
+        project=args.wandb_project,
+        name=run_name,
+        config=vars(args),
+        dir=str(out_dir),
+    )
+
+    # set up the dagger training folder by hard linking from the original bc train data
+    # this preserves the original folder and gives a clean place to append new samples
+    dagger_train_dir = out_dir / "dagger_train"
+    init_dagger_dataset_dir(
+        os.path.join(args.data_dir, "train"),
+        str(dagger_train_dir),
+    )
+    train_set = DemonstrationDataset(str(dagger_train_dir))
+    val_set = DemonstrationDataset(os.path.join(args.data_dir, "val"))
+    print(f"initial train samples {len(train_set)} val samples {len(val_set)}")
+    assert len(train_set) > 0, "dagger train set is empty check --data_dir"
+
+    # load the bc trained student to start from
+    saved_args = torch.load(args.checkpoint, map_location=device, weights_only=False).get("args", {})
+    dropout_p = saved_args.get("dropout", args.dropout)
+    model = PolicyNetwork(n_units_out=5, dropout_p=dropout_p).to(device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    print(f"loaded bc student from {args.checkpoint}")
+
+    # load the expert and wrap it in the same agent interface as the student
+    expert = load_expert(args.expert_path, device)
+    expert_agent = Agent(expert, device)
+    print(f"loaded expert from {args.expert_path}")
+
+    # same as in bc
+    wandb.watch(model, log="gradients", log_freq=200)
+
+    # fresh optimizer at a smaller lr since the model is already trained
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.dagger_lr, weight_decay=args.weight_decay)
+    loss_fn = nn.CrossEntropyLoss()
+
+    # a fixed val loader is fine since val set does not change
+    val_loader = DataLoader(
+        val_set, batch_size=args.batch_size,
+        num_workers=args.num_workers, shuffle=False,
+        drop_last=False, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+
+    # keep a sample for the onnx export at the end
+    sample_state_arr, _ = train_set[0]
+    sample_state = torch.from_numpy(sample_state_arr).unsqueeze(0).to(device)
+
+    best_val_loss = float("inf")
+    global_step = 0
+
+    for iteration in range(args.dagger_iterations):
+        beta = max(args.beta_min, beta_schedule(iteration, args.beta_decay))
+        print(f"\n=== dagger iter {iteration+1}/{args.dagger_iterations} beta {beta:.3f} ===")
+
+        # 1 collect a rollout under mixed policy
+        model.eval()
+        capture = (iteration % args.dagger_video_every == 0)
+        states, actions, rollout_score = dagger_rollout(
+            model, expert_agent, device, beta,
+            seed=args.seed + 1000 + iteration,
+            video_dir=str(out_dir / "videos"),
+            capture_video=capture,
+        )
+        # rollout score is inflated early on because the expert acts a lot
+        # as beta decays it becomes more representative of the student performance
+        print(f"rollout score {rollout_score:.2f} collected {len(states)} new samples")
+
+        # 2 append the new state expert action pairs to the dataset on disk
+        train_set.append(states, actions)
+
+        wandb.log({
+            "dagger/iteration": iteration + 1,
+            "dagger/beta": beta,
+            "dagger/rollout_score": rollout_score,
+            "dagger/dataset_size": len(train_set),
+            "dagger/new_samples": len(states),
+        }, step=global_step)
+        if capture:
+            mp4 = find_latest_mp4(str(out_dir / "videos"))
+            if mp4 is not None:
+                wandb.log(
+                    {"dagger/rollout_video": wandb.Video(mp4, fps=30, format="mp4")},
+                    step=global_step,
+                )
+
+        # 3 rebuild the train loader so it picks up the newly appended files
+        train_loader = DataLoader(
+            train_set, batch_size=args.batch_size,
+            num_workers=args.num_workers, shuffle=True,
+            drop_last=False, pin_memory=True,
+            persistent_workers=args.num_workers > 0,
+        )
+
+        # 4 train for a few epochs on the aggregated dataset
+        for epoch in range(args.dagger_epochs_per_iter):
+            model.train()
+            epoch_loss_sum = 0.0
+            n_seen = 0
+            pbar = tqdm(
+                train_loader,
+                desc=f"iter {iteration+1} epoch {epoch+1}/{args.dagger_epochs_per_iter}",
+                leave=False,
+            )
+            for batch_states, batch_actions in pbar:
+                batch_states = batch_states.to(device, non_blocking=True)
+                batch_actions = batch_actions.to(device, non_blocking=True)
+
+                logits = model(batch_states)
+                loss = loss_fn(logits, batch_actions)
+
+                # entropy monitoring
+                with torch.no_grad():
+                    entropy = Categorical(logits=logits).entropy().mean().item()
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+                wandb.log({
+                    "dagger/train_loss": loss.item(),
+                    "dagger/entropy": entropy,
+                    "dagger/lr": optimizer.param_groups[0]["lr"],
+                }, step=global_step)
+
+                epoch_loss_sum += loss.item() * batch_states.size(0)
+                n_seen += batch_states.size(0)
+                global_step += 1
+                pbar.set_postfix(loss=f"{loss.item():.3f}")
+
+            train_loss_avg = epoch_loss_sum / n_seen
+            val_loss, val_acc = evaluate_on_val(model, val_loader, device, loss_fn)
+
+            wandb.log({
+                "dagger/epoch_train_loss": train_loss_avg,
+                "dagger/epoch_val_loss": val_loss,
+                "dagger/epoch_val_accuracy": val_acc,
+                "dagger/iteration": iteration + 1,
+                "dagger/epoch": epoch + 1,
+            }, step=global_step)
+            print(f"iter {iteration+1} epoch {epoch+1} "
+                  f"train_loss {train_loss_avg:.4f} "
+                  f"val_loss {val_loss:.4f} val_acc {val_acc:.4f}")
+
+            # save best checkpoint on val loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save({
+                    "iteration": iteration + 1,
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "args": vars(args),
+                }, out_dir / "checkpoints" / "best.pt")
+
+    # always save the last checkpoint too
+    torch.save({
+        "iteration": args.dagger_iterations,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+    }, out_dir / "checkpoints" / "last.pt")
+
+    # reload best and export onnx for submission
+    print("loading best for onnx export")
+    best = torch.load(out_dir / "checkpoints" / "best.pt", map_location=device, weights_only=False)
+    model.load_state_dict(best["model_state_dict"])
+    save_as_onnx(model, sample_state, str(out_dir / "checkpoints" / "model.onnx"))
+
+    # final environment evaluation with the best model
+    print("running final evaluation in env")
+    evaluate_in_env(args, model=model, device=device,
+                    video_dir=str(out_dir / "videos"))
+
+    wandb.finish()
+
+
+# ==========================================================
 # entry point
 # ==========================================================
 
 def parse_args():
     p = argparse.ArgumentParser(description="bc training for car racing v3")
-    p.add_argument("--mode", choices=["train_bc", "evaluate"], default="train_bc",
-                   help="train_bc trains the policy from scratch evaluate loads a checkpoint")
+    p.add_argument("--mode", choices=["train_bc", "train_dagger", "evaluate"], default="train_bc",
+                   help="train_bc trains the policy from scratch evaluate loads a checkpoint and train_dagger implements dagger algo with expert and trained policy")
 
     # data and io
     p.add_argument("--data_dir", default=".",
@@ -493,7 +775,22 @@ def parse_args():
     # evaluation
     p.add_argument("--eval_episodes", type=int, default=10)
 
-    # misc
+    # dagger specific
+    p.add_argument("--expert_path", default=None,
+                   help="path to the expert onnx file required for train_dagger mode")
+    p.add_argument("--dagger_iterations", type=int, default=10,
+                   help="number of dagger outer iterations")
+    p.add_argument("--dagger_epochs_per_iter", type=int, default=5,
+                   help="number of training epochs after each rollout")
+    p.add_argument("--dagger_lr", type=float, default=1e-4,
+                   help="learning rate for dagger fine tuning smaller than bc lr")
+    p.add_argument("--beta_decay", type=float, default=0.5,
+                   help="exponential decay base for beta the expert mixing probability")
+    p.add_argument("--beta_min", type=float, default=0.0,
+                   help="floor for beta keeps some expert mixing if greater than zero")
+    p.add_argument("--dagger_video_every", type=int, default=1,
+                   help="record a rollout video every n iterations")
+
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb_project", default="carracing-imitation")
 
@@ -507,6 +804,10 @@ def main():
     elif args.mode == "evaluate":
         assert args.checkpoint is not None, "evaluate mode requires --checkpoint"
         evaluate_in_env(args)
+    elif args.mode == "train_dagger":
+        assert args.checkpoint is not None, "train_dagger requires --checkpoint with a bc model"
+        assert args.expert_path is not None, "train_dagger requires --expert_path"
+        train_dagger(args)
 
 
 if __name__ == "__main__":
