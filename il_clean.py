@@ -505,14 +505,14 @@ def init_dagger_dataset_dir(source_dir, target_dir):
 
 
 def beta_schedule(iteration, decay):
-    # exponential decay starting at 1 0 at iteration 0
+    # exponential decay starting at 1 at iteration 0
     return decay ** iteration
 
 
 def dagger_rollout(model, expert_agent, device, beta, seed,
                    video_dir=None, capture_video=False):
     """
-    run one rollout collecting state expert action pairs
+    run one rollout collecting state & expert-action pairs
     actions to execute come from a mixture of expert and student via beta
     every visited state is labeled with the experts action regardless
     returns the collected states the expert labels and the episode score
@@ -527,8 +527,8 @@ def dagger_rollout(model, expert_agent, device, beta, seed,
     done = False
 
     while not done:
-        # always ask the expert what it would do here this is the label
-        # the expert consumes the full 4 stacked observation
+        # always ask the expert what it would do - the label
+        # the expert takes the full 4 stacked observation
         expert_action = expert_agent.select_action(state)
 
         # decide who actually steps the environment this turn
@@ -633,11 +633,9 @@ def train_dagger(args):
             video_dir=str(out_dir / "videos"),
             capture_video=capture,
         )
-        # rollout score is inflated early on because the expert acts a lot
-        # as beta decays it becomes more representative of the student performance
         print(f"rollout score {rollout_score:.2f} collected {len(states)} new samples")
 
-        # 2 append the new state expert action pairs to the dataset on disk
+        # 2 append the new state expert action pairs to the dataset buffer
         train_set.append(states, actions)
 
         wandb.log({
@@ -714,10 +712,9 @@ def train_dagger(args):
                   f"val_loss {val_loss:.4f} val_acc {val_acc:.4f}")
 
         # run a proper env evaluation to pick the best dagger model
-        # this is the real selection signal val_loss is misleading in dagger
-        # we use a fixed set of 10 seeds so iterations are compared on the same tracks
+        # fixed set of 10 seeds so iterations are compared on the same tracks
         model.eval()
-        # use deterministic argmax for selection so we pick the truly best model
+        # deterministic argmax for selection - pick the truly best model
         # not one that got lucky with sampling
         eval_agent = Agent(model, device, deterministic=True)
         iter_scores = []
