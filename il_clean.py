@@ -67,11 +67,6 @@ class PolicyNetwork(nn.Module):
 # ==========================================================
 
 class DemonstrationDataset(Dataset):
-    """loads npz files of state action pairs from a directory
-    each file contains a uint8 state image and an integer action
-    states are normalized to zero to one on the fly
-    append is used later by dagger to add labeled rollouts
-    """
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self.files = sorted(glob(f"{data_dir}/*.npz"))
@@ -99,7 +94,7 @@ class DemonstrationDataset(Dataset):
 # ==========================================================
 
 class CropObservation(gym.ObservationWrapper):
-    """crop the raw rgb frame to remove the score bar at the bottom"""
+    # crops the raw rgb frame to remove the score bar at the bottom
     def __init__(self, env, shape):
         super().__init__(env)
         self.shape = shape
@@ -111,9 +106,6 @@ class CropObservation(gym.ObservationWrapper):
 
 
 class RecordState(gym.Wrapper):
-    """keeps a buffer of observed states accessible via render
-    dagger will use this to fetch states visited under the student policy
-    """
     def __init__(self, env, reset_clean=True):
         super().__init__(env)
         assert env.render_mode is not None
@@ -171,7 +163,7 @@ def make_env(seed, video_dir=None, capture_video=False):
     env = gym.wrappers.ResizeObservation(env, (84, 84))
     env = gym.wrappers.GrayscaleObservation(env)
     env = RecordState(env, reset_clean=True)
-    # framestack of 4 is required so the expert can consume the same obs
+    # framestack of 4 is required so the expert can take the same obs
     env = gym.wrappers.FrameStackObservation(env, 4)
     env.reset(seed=seed)
     env.action_space.seed(seed)
