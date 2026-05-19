@@ -1,5 +1,4 @@
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import shutil
@@ -141,18 +140,21 @@ class RecordState(gym.Wrapper):
 
 
 class Agent:
-    def __init__(self, model, device):
+    def __init__(self, model, device, deterministic=False):
         self.model = model
         self.device = device
+        self.deterministic = deterministic
 
     def select_action(self, state):
         with torch.no_grad():
-            # rescale uint8 image to zero to one like training data
             state_arr = np.asarray(state, dtype=np.float32)
             state_t = torch.from_numpy(state_arr).unsqueeze(0).to(self.device) / 255.0
             logits = self.model(state_t)
             if isinstance(logits, tuple):
                 logits = logits[0]
+            if self.deterministic:
+                # take the highest-probability action no sampling noise
+                return logits.argmax(dim=1).cpu().numpy()[0]
             probs = Categorical(logits=logits)
             return probs.sample().cpu().numpy()[0]
 
@@ -438,7 +440,7 @@ def evaluate_in_env(args, model=None, device=None, video_dir=None):
         print(f"loaded checkpoint {args.checkpoint}")
 
     model.eval()
-    agent = Agent(model, device)
+    agent = Agent(model, device, deterministic=args.deterministic)
 
     scores = []
     for ep in tqdm(range(args.eval_episodes), desc="eval episodes"):
@@ -715,7 +717,9 @@ def train_dagger(args):
         # this is the real selection signal val_loss is misleading in dagger
         # we use a fixed set of 10 seeds so iterations are compared on the same tracks
         model.eval()
-        eval_agent = Agent(model, device)
+        # use deterministic argmax for selection so we pick the truly best model
+        # not one that got lucky with sampling
+        eval_agent = Agent(model, device, deterministic=True)
         iter_scores = []
         for ep in range(args.dagger_eval_episodes):
             # seeds offset by 10000 so they never overlap with rollout or final eval seeds
@@ -782,6 +786,8 @@ def train_dagger(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="bc training for car racing v3")
+    p.add_argument("--gpu", type=str, default="0")
+
     p.add_argument("--mode", choices=["train_bc", "train_dagger", "evaluate"], default="train_bc",
                    help="train_bc trains the policy from scratch evaluate loads a checkpoint and train_dagger implements dagger algo with expert and trained policy")
 
@@ -805,6 +811,8 @@ def parse_args():
 
     # evaluation
     p.add_argument("--eval_episodes", type=int, default=10)
+    p.add_argument("--deterministic", action="store_true",
+               help="use argmax instead of sampling at evaluation time")
 
     # dagger specific
     p.add_argument("--expert_path", default=None,
@@ -832,6 +840,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", f"{args.gpu}")
+
     if args.mode == "train_bc":
         train_bc(args)
     elif args.mode == "evaluate":
