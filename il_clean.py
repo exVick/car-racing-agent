@@ -619,12 +619,26 @@ def train_dagger(args):
         # 1 collect a rollout under mixed policy
         model.eval()
         capture = (iteration % args.dagger_video_every == 0)
-        states, actions, rollout_score = dagger_rollout(
-            model, expert_agent, device, beta,
-            seed=args.seed + 1000 + iteration,
-            video_dir=str(out_dir / "videos"),
-            capture_video=capture,
-        )
+        # collect multiple rollouts to get more diverse data per iteration
+        all_states = []
+        all_actions = []
+        rollout_scores = []
+        for r in range(args.rollouts_per_iter):
+            r_seed = args.seed + 1000 + iteration * 100 + r
+            # only record video for the first rollout of each iteration
+            r_capture = capture and (r == 0)
+            s, a, sc = dagger_rollout(
+                model, expert_agent, device, beta,
+                seed=r_seed,
+                video_dir=str(out_dir / "videos"),
+                capture_video=r_capture,
+            )
+            all_states.append(s)
+            all_actions.append(a)
+            rollout_scores.append(sc)
+        states = np.concatenate(all_states)
+        actions = np.concatenate(all_actions)
+        rollout_score = float(np.mean(rollout_scores))
         print(f"rollout score {rollout_score:.2f} collected {len(states)} new samples")
 
         # 2 append the new state expert action pairs to the dataset buffer
@@ -820,6 +834,8 @@ def parse_args():
                    help="record a rollout video every n iterations")
     p.add_argument("--dagger_eval_episodes", type=int, default=10,
                    help="number of env episodes used to score each iteration for model selection")
+    p.add_argument("--rollouts_per_iter", type=int, default=1,
+                   help="number of episodes collected per dagger iteration")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb_project", default="carracing-imitation")
