@@ -502,16 +502,33 @@ def beta_schedule(iteration, decay):
 
 
 def dagger_rollout(model, expert_agent, device, beta, seed,
-                   video_dir=None, capture_video=False):
+                   video_dir=None, capture_video=False, max_warmup=0):
     """
-    run one rollout collecting state & expert-action pairs
+    run one rollout collecting state expert action pairs
     actions to execute come from a mixture of expert and student via beta
     every visited state is labeled with the experts action regardless
-    returns the collected states the expert labels and the episode score
+
+    if max_warmup is greater than 0 the expert drives for a random
+    number of steps in 0 to max_warmup before data collection begins
+    this diversifies the starting state of each collected trajectory
+    if the episode ends during warmup empty arrays are returned and the
+    caller should treat the rollout as skipped
     """
     student_agent = Agent(model, device)
     env = make_env(seed=seed, video_dir=video_dir, capture_video=capture_video)
     state, _ = env.reset()
+
+    # optional expert warmup to skip past the always identical starting state
+    # the warmup length is randomized so different rollouts begin at different points
+    if max_warmup > 0:
+        warmup_steps = np.random.randint(0, max_warmup + 1)
+        for _ in range(warmup_steps):
+            warmup_action = expert_agent.select_action(state)
+            state, _, terminated, truncated, _ = env.step(warmup_action)
+            if terminated or truncated:
+                # episode finished during warmup nothing to collect
+                env.close()
+                return np.array([]), np.array([]), 0.0
 
     collected_states = []
     collected_actions = []
@@ -520,18 +537,15 @@ def dagger_rollout(model, expert_agent, device, beta, seed,
 
     while not done:
         # always ask the expert what it would do - the label
-        # the expert takes the full 4 stacked observation
         expert_action = expert_agent.select_action(state)
 
         # decide who actually steps the environment this turn
         if random.random() < beta:
             action_to_execute = expert_action
         else:
-            # student needs only the latest frame as a single channel image
             action_to_execute = student_agent.select_action(state[-1][np.newaxis, ...])
 
         # save the latest single frame paired with the expert label
-        # this keeps the training format consistent with bc demonstrations
         collected_states.append(state[-1])
         collected_actions.append(expert_action)
 
@@ -619,30 +633,73 @@ def train_dagger(args):
         # 1 collect a rollout under mixed policy
         model.eval()
         capture = (iteration % args.dagger_video_every == 0)
-        # collect multiple rollouts to get more diverse data per iteration
+        # 1a) screen candidate seeds with the current student to find hard tracks
+        # using deterministic action selection for stable scoring
+        # the worst rollouts_per_iter tracks become the dagger targets this iteration
+        print(f"screening {args.hard_seed_candidates} candidate seeds for hard tracks")
+        screen_agent = Agent(model, device, deterministic=True)
+        cand_base = args.seed + 50000 + iteration * args.hard_seed_candidates
+        seed_scores = []
+        for cand_idx in range(args.hard_seed_candidates):
+            cand_seed = cand_base + cand_idx
+            sc = run_episode(screen_agent, seed=cand_seed)
+            seed_scores.append((sc, cand_seed))
+
+        # sort ascending pick the rollouts_per_iter worst seeds
+        seed_scores.sort(key=lambda x: x[0])
+        hard_pairs = seed_scores[: args.rollouts_per_iter]
+        hard_seeds = [s for _, s in hard_pairs]
+        hard_scores = [sc for sc, _ in hard_pairs]
+        all_screen_scores = [sc for sc, _ in seed_scores]
+        print(f"hard seeds {hard_seeds} screen scores "
+              f"{[f'{s:.1f}' for s in hard_scores]}")
+
+        wandb.log({
+            "dagger/screen_mean": float(np.mean(all_screen_scores)),
+            "dagger/screen_min": float(np.min(all_screen_scores)),
+            "dagger/screen_max": float(np.max(all_screen_scores)),
+            "dagger/screen_hard_mean": float(np.mean(hard_scores)),
+            "dagger/iteration": iteration + 1,
+        }, step=global_step)
+
+        # 1b) collect dagger rollouts on those hard seeds with random expert warmup
+        # warmup makes each rollout start at a different point in the track
         all_states = []
         all_actions = []
         rollout_scores = []
-        for r in range(args.rollouts_per_iter):
-            r_seed = args.seed + 1000 + iteration * 100 + r
-            # only record video for the first rollout of each iteration
+        for r, hard_seed in enumerate(hard_seeds):
             r_capture = capture and (r == 0)
             s, a, sc = dagger_rollout(
                 model, expert_agent, device, beta,
-                seed=r_seed,
+                seed=hard_seed,
                 video_dir=str(out_dir / "videos"),
                 capture_video=r_capture,
+                max_warmup=args.warmup_steps,
             )
+            # episode finished during warmup skip this rollout silently
+            if len(s) == 0:
+                print(f"rollout on seed {hard_seed} aborted during warmup skipping")
+                continue
             all_states.append(s)
             all_actions.append(a)
             rollout_scores.append(sc)
-        states = np.concatenate(all_states)
-        actions = np.concatenate(all_actions)
-        rollout_score = float(np.mean(rollout_scores))
+
+        # handle the edge case where every rollout aborted during warmup
+        if len(all_states) > 0:
+            states = np.concatenate(all_states)
+            actions = np.concatenate(all_actions)
+            rollout_score = float(np.mean(rollout_scores))
+        else:
+            print("all rollouts aborted during warmup no data added this iteration")
+            states = np.array([])
+            actions = np.array([])
+            rollout_score = 0.0
         print(f"rollout score {rollout_score:.2f} collected {len(states)} new samples")
 
         # 2 append the new state expert action pairs to the dataset buffer
-        train_set.append(states, actions)
+        # skip if all rollouts aborted during warmup
+        if len(states) > 0:
+            train_set.append(states, actions)
 
         wandb.log({
             "dagger/iteration": iteration + 1,
@@ -836,6 +893,10 @@ def parse_args():
                    help="number of env episodes used to score each iteration for model selection")
     p.add_argument("--rollouts_per_iter", type=int, default=1,
                    help="number of episodes collected per dagger iteration")
+    p.add_argument("--hard_seed_candidates", type=int, default=20,
+                   help="number of seeds to screen each iteration we pick the worst rollouts_per_iter")
+    p.add_argument("--warmup_steps", type=int, default=200,
+                   help="max expert warmup steps before data collection 0 disables warmup")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb_project", default="carracing-imitation")
