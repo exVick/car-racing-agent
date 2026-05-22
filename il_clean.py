@@ -1,6 +1,5 @@
 import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-
 import shutil
 import argparse
 import logging
@@ -8,35 +7,40 @@ import random
 from glob import glob
 from pathlib import Path
 from time import strftime
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 from torch.utils.data import DataLoader, Dataset
-
 import gymnasium as gym
 from gymnasium.spaces import Box
-
 import onnx
 from onnx2pytorch import ConvertModel
-
 import wandb
 from tqdm import tqdm
 
-# silence gymnasium warnings about deprecated kwargs etc
+# silence gymnasium warnings about deprecated kwargs
 logging.getLogger("gymnasium").setLevel(logging.ERROR)
 
 
-# ==========================================================
+############################################################
+# !!! DISCLAIMER !!!
+# THIS SCRIPT ASSUMES THE TRAINING AND VALIDATION DATA,
+# AS WELL AS THE EXPERT MODEL
+# WERE ALREADY DOWNLOADEAD 
+############################################################
+
+
+############################################################
 # policy network
-# ==========================================================
+############################################################
 
 class PolicyNetwork(nn.Module):
-    """nature dqn style cnn for 84x84 grayscale inputs
+    """
+    dqn-style cnn for 84x84 grayscale inputs
     outputs n_units_out raw logits one per discrete action
-    dropout is applied between the hidden fc and the output layer
+    dropout between hidden fc and output layer
     """
     def __init__(self, n_units_out, dropout_p=0.3):
         super().__init__()
@@ -44,29 +48,29 @@ class PolicyNetwork(nn.Module):
         self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        # flatten gives 64 times 7 times 7 equal to 3136 features
+        # flatten 64x7x7 = 3136 features
         self.fc1 = nn.Linear(64 * 7 * 7, 512)
         self.dropout = nn.Dropout(dropout_p)
         self.fc_out = nn.Linear(512, n_units_out)
 
     def forward(self, x):
-        # x has shape batch by 1 by 84 by 84 with values in zero to one
+        # x: (1, 84, 84) - values [0,1]
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
-        # collapse channel and spatial dims keeping batch dim
+        # collapse channel and spatial dims, keep batch dim
         x = x.flatten(start_dim=1)
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
-        # raw logits the agent wraps them in a categorical distribution
+        # raw logits - the agent wraps them in a categorical distribution
         return self.fc_out(x)
 
 
-# ==========================================================
+############################################################
 # dataset
-# ==========================================================
+############################################################
 
-class DemonstrationDataset(Dataset):
+class DemonstrationDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self.files = sorted(glob(f"{data_dir}/*.npz"))
@@ -76,7 +80,6 @@ class DemonstrationDataset(Dataset):
 
     def __getitem__(self, idx):
         data = np.load(self.files[idx])
-        # add a channel dim so the shape becomes 1 by 84 by 84
         state = data["state"][np.newaxis, ...].astype(np.float32)
         action = data["action"]
         return state / 255.0, action.item()
@@ -89,9 +92,9 @@ class DemonstrationDataset(Dataset):
             self.files.append(filename)
 
 
-# ==========================================================
+############################################################
 # environment wrappers and agent
-# ==========================================================
+############################################################
 
 class CropObservation(gym.ObservationWrapper):
     # crops the raw rgb frame to remove the score bar at the bottom
@@ -125,7 +128,6 @@ class RecordState(gym.Wrapper):
         return result
 
     def render(self):
-        # return all buffered frames and clear the buffer for next time
         frames = self.frame_list
         self.frame_list = []
         return frames
@@ -201,23 +203,23 @@ def find_latest_mp4(video_dir):
 def save_as_onnx(torch_model, sample_input, model_path):
     torch_model.eval()
     torch.onnx.export(
-        torch_model,
-        sample_input,
-        f=model_path,
-        export_params=True,
-        opset_version=13,
-        do_constant_folding=True,
-        external_data=False,
-        dynamo=False,
-    )
-    # sanity check that the export is parseable
-    ConvertModel(onnx.load(model_path))
+                    torch_model,               # model being run
+                    sample_input,              # model input (or a tuple for multiple inputs)
+                    f=model_path,              # where to save the model (can be a file or file-like object)
+                    export_params=True,        # store the trained parameter weights inside the model file
+                    opset_version=13,          # the ONNX version to export the model to - see https://github.com/microsoft/onnxruntime/blob/master/docs/Versioning.md
+                    do_constant_folding=True,  # preserve architectural info (kernel sizes, strides, etc.) as explicit graph attributes
+                    external_data=False,       # keeps everything in a single .onnx file
+                    dynamo=False,              # export with old logic
+                    )
+    # Test conversion
+    converted = ConvertModel(onnx.load(model_path))
     print(f"onnx export ok at {model_path}")
 
 
-# ==========================================================
-# training and evaluation helpers
-# ==========================================================
+############################################################
+# training and evaluation 
+############################################################
 
 @torch.no_grad()
 def evaluate_on_val(model, val_loader, device, loss_fn):
@@ -246,9 +248,9 @@ def set_seeds(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-# ==========================================================
+############################################################
 # train bc mode
-# ==========================================================
+############################################################
 
 def train_bc(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -323,7 +325,7 @@ def train_bc(args):
             logits = model(states)
             loss = loss_fn(logits, actions)
 
-            # entropy is a signal for how confident the policy is
+            # entropy - signal for how confident the policy is
             with torch.no_grad():
                 entropy = Categorical(logits=logits).entropy().mean().item()
 
@@ -380,7 +382,7 @@ def train_bc(args):
         "args": vars(args),
     }, out_dir / "checkpoints" / "last.pt")
 
-    # reload the best weights and export onnx for the submission server
+    # reload the best weights and export onnx for the server
     print("loading best for onnx export")
     best = torch.load(out_dir / "checkpoints" / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(best["model_state_dict"])
@@ -394,13 +396,13 @@ def train_bc(args):
     wandb.finish()
 
 
-# ==========================================================
+############################################################
 # evaluate mode
-# ==========================================================
+############################################################
 
 def evaluate_in_env(args, model=None, device=None, video_dir=None):
     """
-    run n eval episodes in the env and log scores plus the first video to wandb
+    run n eval episodes in the env and log scores + the first video to wandb
     when called as a standalone mode it loads weights from a checkpoint file
     """
     standalone = model is None
@@ -458,9 +460,9 @@ def evaluate_in_env(args, model=None, device=None, video_dir=None):
     return mean_score, std_score
 
 
-# ==========================================================
+############################################################
 # dagger
-# ==========================================================
+############################################################
 
 def load_expert(expert_path, device):
     """
@@ -475,8 +477,7 @@ def load_expert(expert_path, device):
 def init_dagger_dataset_dir(source_dir, target_dir):
     """
     initialize the dagger train folder by hard linking from the bc train folder
-    hard linking is near instant and avoids duplicating disk usage
-    if the target already has files we reuse them to support resuming a run
+    if the target already has files - reuse them to support resuming a run
     """
     target = Path(target_dir)
     target.mkdir(parents=True, exist_ok=True)
@@ -512,13 +513,13 @@ def dagger_rollout(model, expert_agent, device, beta, seed,
     number of steps in 0 to max_warmup before data collection begins
     this diversifies the starting state of each collected trajectory
     if the episode ends during warmup empty arrays are returned and the
-    caller should treat the rollout as skipped
+    caller should treat the rollout as skipped - THIS HELPED ME REACH FULL POINTS
     """
     student_agent = Agent(model, device)
     env = make_env(seed=seed, video_dir=video_dir, capture_video=capture_video)
     state, _ = env.reset()
 
-    # optional expert warmup to skip past the always identical starting state
+    # optional expert warmup to skip past the (could be identical starting state)
     # the warmup length is randomized so different rollouts begin at different points
     if max_warmup > 0:
         warmup_steps = np.random.randint(0, max_warmup + 1)
@@ -526,7 +527,7 @@ def dagger_rollout(model, expert_agent, device, beta, seed,
             warmup_action = expert_agent.select_action(state)
             state, _, terminated, truncated, _ = env.step(warmup_action)
             if terminated or truncated:
-                # episode finished during warmup nothing to collect
+                # episode finished during warmup - nothing to collect
                 env.close()
                 return np.array([]), np.array([]), 0.0
 
@@ -563,14 +564,14 @@ def train_dagger(args):
     torch.backends.cudnn.benchmark = True
     set_seeds(args.seed)
 
-    # build a unique run directory mirroring train_bc
+    # like train_bc
     run_name = "dagger-" + strftime("%Y-%m-%dT%H-%M-%S")
     out_dir = Path(args.output_dir) / run_name
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     (out_dir / "videos").mkdir(parents=True, exist_ok=True)
     print(f"run dir {out_dir}")
 
-    # init wandb live monitoring
+    # init wandb
     wandb.init(
         project=args.wandb_project,
         name=run_name,
@@ -579,7 +580,6 @@ def train_dagger(args):
     )
 
     # set up the dagger training folder by hard linking from the original bc train data
-    # this preserves the original folder and gives a clean place to append new samples
     dagger_train_dir = out_dir / "dagger_train"
     init_dagger_dataset_dir(
         os.path.join(args.data_dir, "train"),
@@ -610,7 +610,7 @@ def train_dagger(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.dagger_lr, weight_decay=args.weight_decay)
     loss_fn = nn.CrossEntropyLoss()
 
-    # a fixed val loader is fine since val set does not change
+    # fixed val loader since val set does not change
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size,
         num_workers=args.num_workers, shuffle=False,
@@ -622,7 +622,7 @@ def train_dagger(args):
     sample_state_arr, _ = train_set[0]
     sample_state = torch.from_numpy(sample_state_arr).unsqueeze(0).to(device)
     
-    # track the best mean env score across iterations env eval is the real selector
+    # track the best mean env score across iterations - the real selector
     best_dagger_score = -float("inf")
     global_step = 0
 
@@ -630,7 +630,7 @@ def train_dagger(args):
         beta = max(args.beta_min, beta_schedule(iteration, args.beta_decay))
         print(f"\n=== dagger iter {iteration+1}/{args.dagger_iterations} beta {beta:.3f} ===")
 
-        # 1 collect a rollout under mixed policy
+        # 1) collect a rollout under mixed policy
         model.eval()
         capture = (iteration % args.dagger_video_every == 0)
         # 1a) screen candidate seeds with the current student to find hard tracks
@@ -676,7 +676,7 @@ def train_dagger(args):
                 capture_video=r_capture,
                 max_warmup=args.warmup_steps,
             )
-            # episode finished during warmup skip this rollout silently
+            # episode finished during warmup => skip this rollout silently
             if len(s) == 0:
                 print(f"rollout on seed {hard_seed} aborted during warmup skipping")
                 continue
@@ -696,7 +696,7 @@ def train_dagger(args):
             rollout_score = 0.0
         print(f"rollout score {rollout_score:.2f} collected {len(states)} new samples")
 
-        # 2 append the new state expert action pairs to the dataset buffer
+        # 2) append the new state expert action pairs to the dataset buffer
         # skip if all rollouts aborted during warmup
         if len(states) > 0:
             train_set.append(states, actions)
@@ -716,7 +716,7 @@ def train_dagger(args):
                     step=global_step,
                 )
 
-        # 3 rebuild the train loader so it picks up the newly appended files
+        # 3) rebuild train loader so it picks up the newly appended files
         train_loader = DataLoader(
             train_set, batch_size=args.batch_size,
             num_workers=args.num_workers, shuffle=True,
@@ -724,7 +724,7 @@ def train_dagger(args):
             persistent_workers=args.num_workers > 0,
         )
 
-        # 4 train for a few epochs on the aggregated dataset
+        # 4) train on aggregated dataset
         for epoch in range(args.dagger_epochs_per_iter):
             model.train()
             epoch_loss_sum = 0.0
@@ -777,12 +777,11 @@ def train_dagger(args):
         # run a proper env evaluation to pick the best dagger model
         # fixed set of 10 seeds so iterations are compared on the same tracks
         model.eval()
-        # deterministic argmax for selection - pick the truly best model
-        # not one that got lucky with sampling
+        # deterministic argmax for selection - pick the truly best model (not lucky one)
         eval_agent = Agent(model, device, deterministic=True)
         iter_scores = []
         for ep in range(args.dagger_eval_episodes):
-            # seeds offset by 10000 so they never overlap with rollout or final eval seeds
+            # prevent overlap with rollout or final eval seeds
             ep_seed = args.seed + 10000 + ep
             iter_scores.append(run_episode(eval_agent, seed=ep_seed))
 
@@ -840,9 +839,9 @@ def train_dagger(args):
     wandb.finish()
 
 
-# ==========================================================
+############################################################
 # entry point
-# ==========================================================
+############################################################
 
 def parse_args():
     p = argparse.ArgumentParser(description="bc training for car racing v3")
@@ -859,7 +858,7 @@ def parse_args():
     p.add_argument("--checkpoint", default=None,
                    help="path to a pt checkpoint required by evaluate mode")
 
-    # training hyperparameters
+    # training hyperparams
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=4)
@@ -874,7 +873,7 @@ def parse_args():
     p.add_argument("--deterministic", action="store_true",
                help="use argmax instead of sampling at evaluation time")
 
-    # dagger specific
+    # dagger
     p.add_argument("--expert_path", default=None,
                    help="path to the expert onnx file required for train_dagger mode")
     p.add_argument("--dagger_iterations", type=int, default=10,
